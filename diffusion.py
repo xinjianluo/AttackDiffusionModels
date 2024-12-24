@@ -26,7 +26,13 @@ import torch.nn.functional as F
 
 from NCSNv2 import get_default_configs, get_sigmas, NCSNv2, get_optimizer, anneal_dsm_score_estimation, anneal_Langevin_dynamics
 
+from pythae.models import RHVAE, RHVAEConfig
+from pythae.trainers import BaseTrainerConfig
+from pythae.pipelines.training import TrainingPipeline
+from pythae.models.nn.benchmarks.cifar import Encoder_ResNet_VAE_CIFAR, Decoder_ResNet_AE_CIFAR
 
+from pythae.models import AutoModel
+from pythae.samplers import RHVAESampler, RHVAESamplerConfig
 ########################### Below Code for DDPM ###########################
 # constants
 
@@ -855,7 +861,6 @@ def samplingFromDDPM(diffusion, sampleNum=10000, device=None):
 
 def trainConditionalModels(traindata, datasetname, modelname, img_channels, img_size, n_epochs, device, savemodpath):
     logging.critical(f"Start Training {modelname} ...")
-    assert modelname in ("NCSN", "SDE", "SSGAN", "SNGAN"), f"abnormal modelname {modelname}"
     if modelname == "NCSN":
         traindata.resetClass(0)
         model0 = trainNCSN(traindata, datasetname, img_channels, img_size, n_epochs, device)
@@ -876,6 +881,13 @@ def trainConditionalModels(traindata, datasetname, modelname, img_channels, img_
         model0 = trainSNGAN(traindata, n_epochs, device)
         traindata.resetClass(1)
         model1 = trainSNGAN(traindata, n_epochs, device)
+    elif modelname == "RHVAE":
+        traindata.resetClass(0)
+        model0 = trainRHVAE(traindata, img_channels, img_size, n_epochs, savemodpath)
+        traindata.resetClass(1)
+        model1 = trainRHVAE(traindata, img_channels, img_size, n_epochs, savemodpath)
+    else:
+        assert False, f"Unsupported modelname {modelname}"
     
     
     torch.save((model0.state_dict(), model1.state_dict()), savemodpath)
@@ -951,6 +963,55 @@ def trainSSGAN(traindata, n_epochs, device):
     trainer.train()
     return netG 
 
+def trainRHVAE(traindata, img_channels, img_size, n_epochs, savemodpath):
+    resetRandomStates() 
+    # Define models and optimizers
+    subfolder = savemodpath.split("/")[-1].split(".pt")[0] 
+    savedir = f"vaemodels{os.sep}{subfolder}"
+    if not os.path.exists(savedir):
+        os.makedirs(savedir)
+    
+    config = BaseTrainerConfig(
+        output_dir=savedir,
+        learning_rate=1e-4,
+        per_device_train_batch_size=64,
+        per_device_eval_batch_size=64,
+        num_epochs=n_epochs, # Change this to train the model a bit more
+    )
+
+    if img_channels == 3 and img_size == 32:
+        model_config = RHVAEConfig(
+            input_dim=(3, 32, 32),
+            latent_dim=16,
+            n_lf=1,
+            eps_lf=0.001,
+            beta_zero=0.3,
+            temperature=1.5,
+            regularization=0.001
+
+        )
+
+        model = RHVAE(
+            model_config=model_config,
+            encoder=Encoder_ResNet_VAE_CIFAR(model_config), 
+            decoder=Decoder_ResNet_AE_CIFAR(model_config) 
+        )
+    else:
+        assert False, f"Unsupported img_channels {img_channels} and img_size {img_size}"
+
+    pipeline = TrainingPipeline(
+        training_config=config,
+        model=model
+    )
+
+    pipeline(
+        train_data=traindata.XC,
+        eval_data=traindata.XC[:-int(len(traindata)/5)]
+    )
+
+    return model
+
+
 def trainSNGAN(traindata, n_epochs, device):
     resetRandomStates()
     # Define models and optimizers
@@ -980,7 +1041,6 @@ def trainSNGAN(traindata, n_epochs, device):
     return netG 
 
 def samplingConditionalModels(models, modelname, datasetname, img_channels, img_size, device, sampleNum=10000):
-    assert modelname in ("NCSN", "SDE", "SSGAN", "SNGAN"), f"abnormal modelname {modelname}"
     logging.critical(f"Start Sampling from pre-trained {modelname}")
     assert len(models) == 2, f"abnormal, len(models)= {len(models)} should be 2"
     model0, model1 = models 
@@ -997,6 +1057,12 @@ def samplingConditionalModels(models, modelname, datasetname, img_channels, img_
     elif modelname in ("SSGAN", "SNGAN"):
         samples0 = sampleGAN(model0, half, device)
         samples1 = sampleGAN(model1, half, device)
+    elif modelname == "RHVAE":
+        samples0 = sampleRHVAE(model0, half)
+        samples1 = sampleRHVAE(model1, half)
+    else:
+        assert False, f"Unsupported modelname {modelname}"
+    
    
     all_samples = torch.cat((samples0, samples1))    
     assert len(all_samples) == len(labels), f"len(all_samples) {len(all_samples)} != len(labels) {len(labels)}"
@@ -1015,7 +1081,6 @@ def sampleSDE(model, datasetname, img_channels, img_size, sampleNum, device):
         return:
             samples: should with shape (sampleNum, 3, 32, 32) 
     """
-    # the code of SED is not compatible with this repository
     pass 
 
 
@@ -1078,4 +1143,45 @@ def sampleGAN(model, sampleNum, device):
         if runt % time_print_interval == 0:
             logging.critical(f"Finished processing samples {startidx}-{endidx}, time passed: {timeSince(starttime, float(runt)/runtimes)}")        
     return all_samples     
-    
+
+
+def sampleRHVAE(model, sampleNum):
+    resetRandomStates()
+
+    # set up rhvae sampler config
+    rhvae_sampler_config = RHVAESamplerConfig(
+        mcmc_steps_nbr=100,
+        n_lf=10,
+        eps_lf=0.03
+    )
+
+    # create rhvae sampler
+    rhvae_sampler = RHVAESampler(
+        sampler_config=rhvae_sampler_config,
+        model=model
+    )
+
+
+    all_samples = None 
+    batchNum = 512
+    starttime = time.time()
+    runtimes = int(sampleNum/batchNum) + 1
+    time_print_interval = 1 if int(runtimes/5) == 0 else int(runtimes/5)
+    for startidx in range(0, sampleNum, batchNum):
+        endidx = startidx + batchNum 
+        if endidx > sampleNum:
+            endidx = sampleNum 
+
+        with torch.no_grad():
+            batch_samples = rhvae_sampler.sample(num_samples=endidx-startidx)
+        batch_samples = batch_samples.detach().cpu()
+        if all_samples is None:
+            all_samples = batch_samples
+        else:
+            all_samples = torch.cat((all_samples, batch_samples), dim=0)
+            
+        runt = int(startidx/batchNum) + 1
+        if runt % time_print_interval == 0:
+            logging.critical(f"Finished processing samples {startidx}-{endidx}, time passed: {timeSince(starttime, float(runt)/runtimes)}")        
+    return all_samples     
+
